@@ -64,6 +64,46 @@ fn centered_content_x(item_left: i32, item_width: i32, content_width: i32) -> i3
     item_left.saturating_add(item_width.saturating_sub(content_width).max(0) / 2)
 }
 
+/// Move only along the taskbar, keeping the whole strip in a verified empty gap.
+/// Coordinates stored on the widget are local to its own Explorer taskbar.
+fn horizontal_placement(
+    layout: &TaskbarLayout,
+    placement: ChildPlacement,
+    preferred_x: i32,
+) -> Option<ChildPlacement> {
+    use crate::floatbar::placement::{Point, place_in_taskbar};
+
+    if layout.bounds.width() < layout.bounds.height() {
+        return None;
+    }
+    let mut obstacles = layout.obstacles.clone();
+    obstacles.extend(
+        [
+            layout.landmarks.start,
+            layout.landmarks.widgets,
+            layout.landmarks.tray,
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    let point = place_in_taskbar(
+        layout.bounds,
+        &obstacles,
+        placement.width,
+        placement.height,
+        Point {
+            x: layout.bounds.left.saturating_add(preferred_x),
+            y: layout.bounds.top,
+        },
+        8,
+        8,
+    )?;
+    Some(ChildPlacement {
+        x: point.x.saturating_sub(layout.bounds.left),
+        ..placement
+    })
+}
+
 pub fn native_mode_enabled(settings: &codexbar::settings::Settings) -> bool {
     settings.taskbar_widget_enabled
 }
@@ -799,6 +839,7 @@ impl std::fmt::Display for PrepareFailure {
 struct PreparedWidget {
     taskbar: isize,
     placement: ChildPlacement,
+    layout: TaskbarLayout,
 }
 
 struct PreparedWidgets {
@@ -915,13 +956,17 @@ mod windows_host {
     const WM_MOUSEACTIVATE: u32 = 0x0021;
     const WM_TIMER: u32 = 0x0113;
     const WM_MOUSEMOVE: u32 = 0x0200;
+    const WM_LBUTTONDOWN: u32 = 0x0201;
     const WM_LBUTTONUP: u32 = 0x0202;
+    const WM_CANCELMODE: u32 = 0x001F;
+    const WM_CAPTURECHANGED: u32 = 0x0215;
     const WM_MOUSELEAVE: u32 = 0x02A3;
     const MA_NOACTIVATE: isize = 3;
     const IDC_ARROW: usize = 32512;
     const TME_LEAVE: u32 = 0x0000_0002;
     const HOVER_TIMER_ID: usize = 0xCE11;
     const HOVER_DWELL_MS: u32 = 150;
+    const SM_CXDRAG: i32 = 68;
     const HOVER_DISMISS_GRACE: std::time::Duration = std::time::Duration::from_millis(180);
     const HOVER_POINTER_POLL: std::time::Duration = std::time::Duration::from_millis(50);
     const TRANSPARENT: i32 = 1;
@@ -935,6 +980,23 @@ mod windows_host {
     struct HostedWidget {
         hwnd: isize,
         taskbar: isize,
+        layout: Option<TaskbarLayout>,
+        placement: Option<ChildPlacement>,
+        preferred_x: Option<i32>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct DragState {
+        hwnd: isize,
+        pointer_x: i32,
+        widget_x: i32,
+        moved: bool,
+    }
+
+    // Window messages can re-enter during SetCapture/SetWindowPos. Never hold
+    // the host mutex across those calls or borrow this state across them.
+    std::thread_local! {
+        static DRAG: std::cell::Cell<Option<DragState>> = const { std::cell::Cell::new(None) };
     }
 
     #[derive(Debug, Default)]
@@ -1167,7 +1229,14 @@ mod windows_host {
         );
         let widgets = placements
             .into_iter()
-            .map(|(taskbar, placement)| PreparedWidget { taskbar, placement })
+            .filter_map(|(taskbar, placement)| {
+                let layout = layouts.iter().find(|layout| layout.window_handle == taskbar)?;
+                Some(PreparedWidget {
+                    taskbar,
+                    placement,
+                    layout: layout.clone(),
+                })
+            })
             .collect::<Vec<_>>();
         if widgets.is_empty() && rejected_taskbars.is_empty() {
             return Err(PrepareFailure::TransientLandmarks);
@@ -1223,6 +1292,7 @@ mod windows_host {
                     state.widgets.push(HostedWidget {
                         hwnd: 0,
                         taskbar: prepared_widget.taskbar,
+                        ..HostedWidget::default()
                     });
                     state.widgets.len() - 1
                 });
@@ -1238,15 +1308,31 @@ mod windows_host {
                 tracing::info!("Created native Ceiling taskbar widget");
             }
 
+            // Reapply the user's horizontal choice on every watchdog refresh.
+            // Fresh landmarks still move it out of the way of new taskbar buttons.
+            let placement = widget
+                .preferred_x
+                .and_then(|x| {
+                    horizontal_placement(&prepared_widget.layout, prepared_widget.placement, x)
+                })
+                .unwrap_or(prepared_widget.placement);
+            widget.layout = Some(prepared_widget.layout);
+            widget.placement = Some(placement);
+            if DRAG.get().is_some_and(|drag| drag.hwnd == widget.hwnd) {
+                if model_changed {
+                    unsafe { InvalidateRect(widget.hwnd, std::ptr::null(), 0) };
+                }
+                continue;
+            }
             unsafe {
                 SetWindowRgn(widget.hwnd, 0, 1);
                 SetWindowPos(
                     widget.hwnd,
                     0,
-                    prepared_widget.placement.x,
-                    prepared_widget.placement.y,
-                    prepared_widget.placement.width,
-                    prepared_widget.placement.height,
+                    placement.x,
+                    placement.y,
+                    placement.width,
+                    placement.height,
                     SWP_NOACTIVATE | SWP_NOOWNERZORDER,
                 );
                 ShowWindow(widget.hwnd, SW_SHOWNA);
@@ -1480,6 +1566,89 @@ mod windows_host {
         unsafe { RegisterClassExW(&wc) != 0 }
     }
 
+    fn begin_drag(hwnd: isize) {
+        cancel_hover_dwell(hwnd);
+        let Some(pointer) = cursor_position() else {
+            return;
+        };
+        let placement = HOST.get().and_then(|host| {
+            host.try_lock()
+                .ok()?
+                .widgets
+                .iter()
+                .find(|widget| widget.hwnd == hwnd)?
+                .placement
+        });
+        let Some(placement) = placement else {
+            return;
+        };
+        DRAG.set(Some(DragState {
+            hwnd,
+            pointer_x: pointer.x,
+            widget_x: placement.x,
+            moved: false,
+        }));
+        unsafe { SetCapture(hwnd) };
+        if unsafe { GetCapture() } != hwnd {
+            DRAG.set(None);
+        }
+    }
+
+    fn move_drag(hwnd: isize) -> bool {
+        let Some(mut drag) = DRAG.get().filter(|drag| drag.hwnd == hwnd) else {
+            return false;
+        };
+        let Some(pointer) = cursor_position() else {
+            return true;
+        };
+        let delta = pointer.x.saturating_sub(drag.pointer_x);
+        // Preserve normal clicks and tiny hand movements. Once dragging starts,
+        // returning to the starting point must not turn it back into a click.
+        drag.moved |= delta.unsigned_abs() >= unsafe { GetSystemMetrics(SM_CXDRAG) }.max(1) as u32;
+        DRAG.set(Some(drag));
+        if !drag.moved {
+            return true;
+        }
+        let placement = HOST.get().and_then(|host| {
+            let mut state = host.try_lock().ok()?;
+            let widget = state
+                .widgets
+                .iter_mut()
+                .find(|widget| widget.hwnd == hwnd)?;
+            let placement = horizontal_placement(
+                widget.layout.as_ref()?,
+                widget.placement?,
+                drag.widget_x.saturating_add(delta),
+            )?;
+            widget.preferred_x = Some(placement.x);
+            widget.placement = Some(placement);
+            Some(placement)
+        });
+        if let Some(placement) = placement {
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    0,
+                    placement.x,
+                    placement.y,
+                    placement.width,
+                    placement.height,
+                    SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                );
+            }
+        }
+        true
+    }
+
+    fn finish_drag(hwnd: isize) -> Option<DragState> {
+        let drag = DRAG.get().filter(|drag| drag.hwnd == hwnd)?;
+        DRAG.set(None);
+        if unsafe { GetCapture() } == hwnd {
+            unsafe { ReleaseCapture() };
+        }
+        Some(drag)
+    }
+
     unsafe extern "system" fn widget_window_proc(
         hwnd: isize,
         message: u32,
@@ -1498,7 +1667,17 @@ mod windows_host {
                 1
             }
             WM_MOUSEMOVE => {
-                begin_hover_dwell(hwnd);
+                if !move_drag(hwnd) {
+                    begin_hover_dwell(hwnd);
+                }
+                0
+            }
+            WM_LBUTTONDOWN => {
+                begin_drag(hwnd);
+                0
+            }
+            WM_CANCELMODE | WM_CAPTURECHANGED => {
+                finish_drag(hwnd);
                 0
             }
             WM_MOUSELEAVE => {
@@ -1507,21 +1686,28 @@ mod windows_host {
             }
             WM_TIMER if wparam == HOVER_TIMER_ID => {
                 unsafe { KillTimer(hwnd, HOVER_TIMER_ID) };
-                if hover_open_enabled() {
+                if DRAG.get().is_none() && hover_open_enabled() {
                     open_flyout(hwnd);
                 }
                 0
             }
             WM_LBUTTONUP => {
+                move_drag(hwnd);
+                let clicked = finish_drag(hwnd).is_some_and(|drag| !drag.moved);
                 // A deliberate click owns the interaction until the pointer
                 // leaves, so the pending hover timer cannot immediately undo
                 // a click-to-close action.
                 unsafe { KillTimer(hwnd, HOVER_TIMER_ID) };
-                HOVER_FLYOUT_OPEN.store(false, Ordering::Release);
-                toggle_flyout(hwnd);
+                if clicked
+                    && cursor_position().is_some_and(|point| point_is_inside_window(hwnd, point))
+                {
+                    HOVER_FLYOUT_OPEN.store(false, Ordering::Release);
+                    toggle_flyout(hwnd);
+                }
                 0
             }
             WM_DESTROY => {
+                finish_drag(hwnd);
                 cancel_hover_dwell(hwnd);
                 0
             }
@@ -2381,6 +2567,10 @@ mod windows_host {
         fn GetClientRect(hwnd: isize, rect: *mut WinRect) -> i32;
         fn GetWindowRect(hwnd: isize, rect: *mut std::ffi::c_void) -> i32;
         fn GetCursorPos(point: *mut WinPoint) -> i32;
+        fn SetCapture(hwnd: isize) -> isize;
+        fn GetCapture() -> isize;
+        fn ReleaseCapture() -> i32;
+        fn GetSystemMetrics(index: i32) -> i32;
         fn GetDC(hwnd: isize) -> isize;
         fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
         fn FillRect(hdc: isize, rect: *const WinRect, brush: isize) -> i32;
@@ -2511,6 +2701,138 @@ mod tests {
         assert!(!layout_is_enabled(&secondary, false));
         assert!(layout_is_enabled(&primary, true));
         assert!(layout_is_enabled(&secondary, true));
+    }
+
+    #[test]
+    fn horizontal_drag_moves_both_ways_without_changing_height_or_vertical_position() {
+        let layout = layout(
+            Rect {
+                left: 0,
+                top: 1032,
+                right: 1920,
+                bottom: 1080,
+            },
+            Vec::new(),
+        );
+        let original = ChildPlacement {
+            x: 500,
+            y: 0,
+            width: 312,
+            height: 48,
+        };
+        for x in [300, 700] {
+            assert_eq!(
+                horizontal_placement(&layout, original, x),
+                Some(ChildPlacement { x, ..original })
+            );
+        }
+    }
+
+    #[test]
+    fn horizontal_drag_clamps_at_both_taskbar_edges_on_negative_coordinate_monitors() {
+        let layout = layout(
+            Rect {
+                left: -1920,
+                top: 1032,
+                right: 0,
+                bottom: 1080,
+            },
+            Vec::new(),
+        );
+        let original = ChildPlacement {
+            x: 500,
+            y: 0,
+            width: 312,
+            height: 48,
+        };
+        assert_eq!(horizontal_placement(&layout, original, -500).unwrap().x, 8);
+        assert_eq!(horizontal_placement(&layout, original, 2500).unwrap().x, 1600);
+    }
+
+    #[test]
+    fn horizontal_drag_avoids_buttons_and_landmarks_in_both_lanes() {
+        let bounds = Rect {
+            left: 0,
+            top: 1032,
+            right: 1920,
+            bottom: 1080,
+        };
+        let mut layout = layout(
+            bounds,
+            vec![Rect {
+                left: 848,
+                right: 1100,
+                ..bounds
+            }],
+        );
+        layout.landmarks = TaskbarLandmarks {
+            widgets: Some(Rect {
+                left: 0,
+                right: 160,
+                ..bounds
+            }),
+            start: Some(Rect {
+                left: 800,
+                right: 848,
+                ..bounds
+            }),
+            tray: Some(Rect {
+                left: 1700,
+                right: 1920,
+                ..bounds
+            }),
+        };
+        let original = ChildPlacement {
+            x: 400,
+            y: 0,
+            width: 312,
+            height: 48,
+        };
+        for (requested, expected) in [(0, 168), (600, 480), (900, 1108), (1600, 1380)] {
+            assert_eq!(
+                horizontal_placement(&layout, original, requested).unwrap().x,
+                expected
+            );
+        }
+        // A normal watchdog pass preserves the dragged position; a newly
+        // pinned app forces the strip into another verified gap.
+        assert_eq!(horizontal_placement(&layout, original, 1200).unwrap().x, 1200);
+        layout.obstacles.push(Rect {
+            left: 1100,
+            right: 1400,
+            ..bounds
+        });
+        assert_eq!(horizontal_placement(&layout, original, 1200).unwrap().x, 480);
+    }
+
+    #[test]
+    fn horizontal_drag_refuses_a_full_or_vertical_taskbar() {
+        let bounds = Rect {
+            left: 0,
+            top: 1032,
+            right: 1920,
+            bottom: 1080,
+        };
+        let original = ChildPlacement {
+            x: 400,
+            y: 0,
+            width: 312,
+            height: 48,
+        };
+        assert_eq!(
+            horizontal_placement(&layout(bounds, vec![bounds]), original, 600),
+            None
+        );
+        let vertical = Rect {
+            left: 0,
+            top: 0,
+            right: 48,
+            bottom: 1080,
+        };
+        assert_eq!(
+            horizontal_placement(&layout(vertical, Vec::new()), original, 600),
+            None
+        );
     }
 
     #[test]
@@ -4098,6 +4420,15 @@ mod tests {
             widgets: (0..taskbar_count)
                 .map(|index| PreparedWidget {
                     taskbar: index as isize + 1,
+                    layout: layout(
+                        Rect {
+                            left: 0,
+                            top: 1032,
+                            right: 1920,
+                            bottom: 1080,
+                        },
+                        Vec::new(),
+                    ),
                     placement: ChildPlacement {
                         x: 0,
                         y: 0,
