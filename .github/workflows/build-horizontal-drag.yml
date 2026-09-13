@@ -1,0 +1,52 @@
+name: Build horizontal drag portable
+on:
+  push:
+    branches: [codex/build-taskbar-horizontal-drag]
+permissions:
+  contents: read
+jobs:
+  portable:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86
+        with:
+          version: 10.18.1
+          run_install: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .node-version
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          shared-key: horizontal-drag-portable
+      - name: Check formatting
+        shell: pwsh
+        run: |
+          cargo fmt --all
+          git diff --exit-code
+      - run: pnpm --dir apps/desktop-tauri install --frozen-lockfile
+      - name: Test native taskbar behavior
+        run: cargo test --locked --release --manifest-path apps/desktop-tauri/src-tauri/Cargo.toml taskbar_widget
+      - name: Check desktop code
+        run: cargo clippy --locked --release --manifest-path apps/desktop-tauri/src-tauri/Cargo.toml --all-targets -- -D warnings
+      - name: Build portable application
+        run: pnpm --dir apps/desktop-tauri exec tauri build --ci --no-bundle
+      - name: Record executable hash and source
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force portable | Out-Null
+          Copy-Item target/release/codexbar-desktop-tauri.exe portable/Ceiling-1.5.37-portable.exe
+          Get-FileHash portable/Ceiling-1.5.37-portable.exe -Algorithm SHA256 | Format-List | Out-File portable/SHA256.txt
+          git rev-parse HEAD | Out-File portable/source-commit.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: Ceiling-horizontal-drag-portable
+          path: portable/
+          if-no-files-found: error
+          retention-days: 7
