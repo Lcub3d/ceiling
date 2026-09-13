@@ -1230,7 +1230,9 @@ mod windows_host {
         let widgets = placements
             .into_iter()
             .filter_map(|(taskbar, placement)| {
-                let layout = layouts.iter().find(|layout| layout.window_handle == taskbar)?;
+                let layout = layouts
+                    .iter()
+                    .find(|layout| layout.window_handle == taskbar)?;
                 Some(PreparedWidget {
                     taskbar,
                     placement,
@@ -2746,7 +2748,10 @@ mod tests {
             height: 48,
         };
         assert_eq!(horizontal_placement(&layout, original, -500).unwrap().x, 8);
-        assert_eq!(horizontal_placement(&layout, original, 2500).unwrap().x, 1600);
+        assert_eq!(
+            horizontal_placement(&layout, original, 2500).unwrap().x,
+            1600
+        );
     }
 
     #[test]
@@ -2790,19 +2795,27 @@ mod tests {
         };
         for (requested, expected) in [(0, 168), (600, 480), (900, 1108), (1600, 1380)] {
             assert_eq!(
-                horizontal_placement(&layout, original, requested).unwrap().x,
+                horizontal_placement(&layout, original, requested)
+                    .unwrap()
+                    .x,
                 expected
             );
         }
         // A normal watchdog pass preserves the dragged position; a newly
         // pinned app forces the strip into another verified gap.
-        assert_eq!(horizontal_placement(&layout, original, 1200).unwrap().x, 1200);
+        assert_eq!(
+            horizontal_placement(&layout, original, 1200).unwrap().x,
+            1200
+        );
         layout.obstacles.push(Rect {
             left: 1100,
             right: 1400,
             ..bounds
         });
-        assert_eq!(horizontal_placement(&layout, original, 1200).unwrap().x, 480);
+        assert_eq!(
+            horizontal_placement(&layout, original, 1200).unwrap().x,
+            480
+        );
     }
 
     #[test]
