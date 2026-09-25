@@ -1,0 +1,33 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.lcub3d.notara'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.lcub3d.notara.android"
+        minSdk 24
+        targetSdk 35
+        versionCode 1
+        versionName "0.1.4-unofficial.1"
+    }
+
+    signingConfigs {
+        release {
+            def ksPath = System.getenv("NOTARA_KEYSTORE")
+            storeFile ksPath ? file(ksPath) : rootProject.file("notara-release.jks")
+            storePassword System.getenv("NOTARA_STORE_PASSWORD") ?: "changeit-notara"
+            keyAlias System.getenv("NOTARA_KEY_ALIAS") ?: "notara"
+            keyPassword System.getenv("NOTARA_KEY_PASSWORD") ?: "changeit-notara"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+}
