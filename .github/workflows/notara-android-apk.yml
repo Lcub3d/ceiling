@@ -1,0 +1,62 @@
+name: Build Notara Android APK
+
+on:
+  push:
+    branches:
+      - build/notara-android-apk
+    paths:
+      - 'android-notara/**'
+      - '.github/workflows/notara-android-apk.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Generate signing keystore
+        working-directory: android-notara
+        run: |
+          keytool -genkeypair -v \
+            -keystore notara-release.jks \
+            -storepass changeit-notara \
+            -keypass changeit-notara \
+            -alias notara \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Notara Android Unofficial, O=Lcub3d, C=SG"
+
+      - name: Build signed release APK
+        working-directory: android-notara
+        env:
+          NOTARA_KEYSTORE: ${{ github.workspace }}/android-notara/notara-release.jks
+          NOTARA_STORE_PASSWORD: changeit-notara
+          NOTARA_KEY_ALIAS: notara
+          NOTARA_KEY_PASSWORD: changeit-notara
+        run: gradle :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Rename APK
+        run: |
+          cp android-notara/app/build/outputs/apk/release/app-release.apk \
+             android-notara/Notara-Android-v0.1.4-unofficial.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: notara-android-release-apk
+          path: android-notara/Notara-Android-v0.1.4-unofficial.apk
+          if-no-files-found: error
