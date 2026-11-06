@@ -2918,12 +2918,18 @@ mod tests {
                         requested,
                         &live_obstacles,
                     ),
-                    Some(ChildPlacement { x: 1205, ..original })
+                    Some(ChildPlacement {
+                        x: 1205,
+                        ..original
+                    })
                 );
             }
             assert_eq!(
                 horizontal_placement_with_obstacles(&layout, original, 1100, &live_obstacles),
-                Some(ChildPlacement { x: 1100, ..original })
+                Some(ChildPlacement {
+                    x: 1100,
+                    ..original
+                })
             );
         }
     }
