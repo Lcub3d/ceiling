@@ -129,7 +129,33 @@ impl From<WinRect> for Rect {
 #[cfg(windows)]
 struct ChildEnumContext {
     taskbar: Rect,
+    own_process_id: u32,
     obstacles: Vec<Rect>,
+}
+
+/// Compact native windows occupying the taskbar band, including third-party
+/// top-level overlays which are not children of Explorer. No UIA calls: this
+/// can also refresh native obstacles while the user is dragging the strip.
+#[cfg(windows)]
+pub(crate) fn native_obstacles(taskbar_handle: isize, taskbar_bounds: Rect) -> Vec<Rect> {
+    if taskbar_handle == 0 {
+        return Vec::new();
+    }
+    let mut context = ChildEnumContext {
+        taskbar: taskbar_bounds,
+        own_process_id: std::process::id(),
+        obstacles: Vec::new(),
+    };
+    let context_ptr = &mut context as *mut ChildEnumContext as isize;
+    unsafe {
+        EnumChildWindows(taskbar_handle, Some(collect_child), context_ptr);
+        EnumWindows(Some(collect_child), context_ptr);
+    }
+    context
+        .obstacles
+        .sort_by_key(|rect| (rect.left, rect.top, rect.right, rect.bottom));
+    context.obstacles.dedup();
+    context.obstacles
 }
 
 #[cfg(windows)]
@@ -190,15 +216,7 @@ unsafe fn layout_for_taskbar(hwnd: isize, primary: bool) -> Option<TaskbarLayout
         }
 
         let monitor_bounds = monitor_rect(hwnd).unwrap_or(bounds);
-        let mut context = ChildEnumContext {
-            taskbar: bounds,
-            obstacles: Vec::new(),
-        };
-        EnumChildWindows(
-            hwnd,
-            Some(collect_child),
-            (&mut context as *mut ChildEnumContext).cast::<std::ffi::c_void>() as isize,
-        );
+        let mut obstacles = native_obstacles(hwnd, bounds);
 
         let mut landmarks = TaskbarLandmarks::default();
 
@@ -210,7 +228,7 @@ unsafe fn layout_for_taskbar(hwnd: isize, primary: bool) -> Option<TaskbarLayout
         let tray_class = wide("TrayNotifyWnd");
         let tray = FindWindowExW(hwnd, 0, tray_class.as_ptr(), std::ptr::null());
         if let Some(tray_rect) = window_rect(tray) {
-            context.obstacles.push(tray_rect);
+            obstacles.push(tray_rect);
             landmarks.tray = Some(tray_rect);
         }
 
@@ -227,19 +245,15 @@ unsafe fn layout_for_taskbar(hwnd: isize, primary: bool) -> Option<TaskbarLayout
                 _ => {}
             }
         }
-        context
-            .obstacles
-            .extend(automation_buttons.into_iter().map(|button| button.bounds));
+        obstacles.extend(automation_buttons.into_iter().map(|button| button.bounds));
 
-        context
-            .obstacles
-            .sort_by_key(|rect| (rect.left, rect.top, rect.right, rect.bottom));
-        context.obstacles.dedup();
+        obstacles.sort_by_key(|rect| (rect.left, rect.top, rect.right, rect.bottom));
+        obstacles.dedup();
         Some(TaskbarLayout {
             window_handle: hwnd,
             bounds,
             monitor_bounds,
-            obstacles: context.obstacles,
+            obstacles,
             landmarks,
             primary,
         })
@@ -320,48 +334,66 @@ unsafe fn uia_buttons(hwnd: isize) -> Vec<AutomationButton> {
 #[cfg(windows)]
 unsafe extern "system" fn collect_child(hwnd: isize, lparam: isize) -> i32 {
     unsafe {
-        if IsWindowVisible(hwnd) == 0 {
-            return 1;
-        }
-        if window_class(hwnd).as_deref() == Some("CeilingNativeTaskbarWidget") {
-            return 1;
-        }
         let context = &mut *(lparam as *mut ChildEnumContext);
+        let mut process_id = 0;
+        GetWindowThreadProcessId(hwnd, &mut process_id);
+        if !native_window_is_external(
+            IsWindowVisible(hwnd) != 0,
+            window_class(hwnd).as_deref(),
+            process_id,
+            context.own_process_id,
+        ) {
+            return 1;
+        }
         let Some(rect) = window_rect(hwnd) else {
             return 1;
         };
-        let width = rect.width();
-        let height = rect.height();
-        let horizontal = context.taskbar.width() >= context.taskbar.height();
-        let taskbar_major = if horizontal {
-            context.taskbar.width()
-        } else {
-            context.taskbar.height()
-        };
-        let rect_major = if horizontal { width } else { height };
-        let rect_cross = if horizontal { height } else { width };
-        let taskbar_cross = if horizontal {
-            context.taskbar.height()
-        } else {
-            context.taskbar.width()
-        };
-
-        // Ignore invalid rectangles and shell composition containers that
-        // span almost the complete taskbar. Smaller visible children are
-        // useful obstacle hints on both classic and modern taskbars.
-        if width > 0
-            && height > 0
-            && rect_major < taskbar_major.saturating_mul(3) / 4
-            && rect_cross <= taskbar_cross.saturating_mul(2)
-            && rect.left < context.taskbar.right
-            && rect.right > context.taskbar.left
-            && rect.top < context.taskbar.bottom
-            && rect.bottom > context.taskbar.top
-        {
+        if native_rect_is_obstacle(context.taskbar, rect) {
             context.obstacles.push(rect);
         }
         1
     }
+}
+
+#[cfg(any(windows, test))]
+fn native_window_is_external(
+    visible: bool,
+    class_name: Option<&str>,
+    process_id: u32,
+    own_process_id: u32,
+) -> bool {
+    visible && process_id != own_process_id && class_name != Some("CeilingNativeTaskbarWidget")
+}
+
+#[cfg(any(windows, test))]
+fn native_rect_is_obstacle(taskbar: Rect, rect: Rect) -> bool {
+    let width = rect.width();
+    let height = rect.height();
+    let horizontal = taskbar.width() >= taskbar.height();
+    let taskbar_major = if horizontal {
+        taskbar.width()
+    } else {
+        taskbar.height()
+    };
+    let rect_major = if horizontal { width } else { height };
+    let rect_cross = if horizontal { height } else { width };
+    let taskbar_cross = if horizontal {
+        taskbar.height()
+    } else {
+        taskbar.width()
+    };
+
+    // Preserve the child-HWND size policy for compact top-level overlays too.
+    // Full taskbar composition containers and normal application windows must
+    // not consume the whole lane merely because they intersect its edge.
+    width > 0
+        && height > 0
+        && rect_major < taskbar_major.saturating_mul(3) / 4
+        && rect_cross <= taskbar_cross.saturating_mul(2)
+        && rect.left < taskbar.right
+        && rect.right > taskbar.left
+        && rect.top < taskbar.bottom
+        && rect.bottom > taskbar.top
 }
 
 #[cfg(windows)]
@@ -429,11 +461,126 @@ unsafe extern "system" {
         lparam: isize,
     ) -> i32;
     fn IsWindowVisible(hwnd: isize) -> i32;
+    fn GetWindowThreadProcessId(hwnd: isize, process_id: *mut u32) -> u32;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_third_party_overlays_are_taskbar_obstacles() {
+        let taskbar = Rect {
+            left: 0,
+            top: 1019,
+            right: 1707,
+            bottom: 1067,
+        };
+        // Independent top-level HWNDs, not children of Explorer's taskbar.
+        let overlays = [
+            Rect {
+                left: 1319,
+                top: 1023,
+                right: 1383,
+                bottom: 1061,
+            },
+            Rect {
+                left: 1317,
+                top: 1023,
+                right: 1409,
+                bottom: 1063,
+            },
+        ];
+        for overlay in overlays {
+            assert!(native_rect_is_obstacle(taskbar, overlay));
+            let translate = |rect: Rect| Rect {
+                left: rect.left - 1707,
+                right: rect.right - 1707,
+                ..rect
+            };
+            assert!(native_rect_is_obstacle(
+                translate(taskbar),
+                translate(overlay)
+            ));
+        }
+    }
+
+    #[test]
+    fn native_obstacles_exclude_self_and_hidden_windows() {
+        for class_name in [
+            Some("QiyaoShichen.Widget.v1"),
+            Some("Qt51514QWindowToolSaveBits"),
+            None,
+        ] {
+            assert!(native_window_is_external(true, class_name, 20, 10));
+            assert!(!native_window_is_external(false, class_name, 20, 10));
+            assert!(!native_window_is_external(true, class_name, 10, 10));
+        }
+        assert!(!native_window_is_external(
+            true,
+            Some("CeilingNativeTaskbarWidget"),
+            20,
+            10
+        ));
+    }
+
+    #[test]
+    fn native_obstacles_ignore_containers_and_windows_outside_the_lane() {
+        let taskbar = Rect {
+            left: 0,
+            top: 1019,
+            right: 1707,
+            bottom: 1067,
+        };
+        let rect = |left, top, right, bottom| Rect {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        for candidate in [
+            taskbar,
+            rect(0, 0, 1707, 1067),
+            rect(100, 400, 900, 1040),
+            rect(100, 1023, 100, 1063),
+            rect(200, 1023, 100, 1063),
+            rect(100, 1063, 200, 1023),
+            rect(1707, 1023, 1800, 1063),
+            rect(-100, 1023, 0, 1063),
+            rect(100, 900, 200, 1019),
+            rect(100, 1067, 200, 1100),
+        ] {
+            assert!(!native_rect_is_obstacle(taskbar, candidate), "{candidate:?}");
+        }
+    }
+
+    #[test]
+    fn native_obstacles_preserve_vertical_taskbar_support() {
+        let taskbar = Rect {
+            left: -48,
+            top: 0,
+            right: 0,
+            bottom: 1080,
+        };
+        assert!(native_rect_is_obstacle(
+            taskbar,
+            Rect {
+                left: -44,
+                top: 400,
+                right: -4,
+                bottom: 464,
+            }
+        ));
+        assert!(!native_rect_is_obstacle(
+            taskbar,
+            Rect {
+                left: -200,
+                top: 400,
+                right: -4,
+                bottom: 464,
+            }
+        ));
+    }
 
     fn layout(monitor_bounds: Rect, bounds: Rect, primary: bool) -> TaskbarLayout {
         TaskbarLayout {
