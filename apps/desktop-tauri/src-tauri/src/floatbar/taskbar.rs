@@ -550,7 +550,10 @@ mod tests {
             rect(100, 900, 200, 1019),
             rect(100, 1067, 200, 1100),
         ] {
-            assert!(!native_rect_is_obstacle(taskbar, candidate), "{candidate:?}");
+            assert!(
+                !native_rect_is_obstacle(taskbar, candidate),
+                "{candidate:?}"
+            );
         }
     }
 
