@@ -71,12 +71,22 @@ fn horizontal_placement(
     placement: ChildPlacement,
     preferred_x: i32,
 ) -> Option<ChildPlacement> {
+    horizontal_placement_with_obstacles(layout, placement, preferred_x, &[])
+}
+
+fn horizontal_placement_with_obstacles(
+    layout: &TaskbarLayout,
+    placement: ChildPlacement,
+    preferred_x: i32,
+    live_obstacles: &[crate::floatbar::placement::Rect],
+) -> Option<ChildPlacement> {
     use crate::floatbar::placement::{Point, place_in_taskbar};
 
     if layout.bounds.width() < layout.bounds.height() {
         return None;
     }
     let mut obstacles = layout.obstacles.clone();
+    obstacles.extend_from_slice(live_obstacles);
     obstacles.extend(
         [
             layout.landmarks.start,
@@ -1611,22 +1621,37 @@ mod windows_host {
         if !drag.moved {
             return true;
         }
-        let placement = HOST.get().and_then(|host| {
+        let snapshot = HOST.get().and_then(|host| {
+            let state = host.try_lock().ok()?;
+            let widget = state.widgets.iter().find(|widget| widget.hwnd == hwnd)?;
+            Some((widget.taskbar, widget.layout.clone()?, widget.placement?))
+        });
+        let Some((taskbar, layout, current_placement)) = snapshot else {
+            return true;
+        };
+        // Third-party clocks and network meters can be independent HWNDs,
+        // and can move between the five-second UIA discovery passes. Refresh
+        // only the lightweight native rectangles here, outside the host lock.
+        let live_obstacles = crate::floatbar::taskbar::native_obstacles(taskbar, layout.bounds);
+        let Some(placement) = horizontal_placement_with_obstacles(
+            &layout,
+            current_placement,
+            drag.widget_x.saturating_add(delta),
+            &live_obstacles,
+        ) else {
+            return true;
+        };
+        let updated = HOST.get().and_then(|host| {
             let mut state = host.try_lock().ok()?;
             let widget = state
                 .widgets
                 .iter_mut()
                 .find(|widget| widget.hwnd == hwnd)?;
-            let placement = horizontal_placement(
-                widget.layout.as_ref()?,
-                widget.placement?,
-                drag.widget_x.saturating_add(delta),
-            )?;
             widget.preferred_x = Some(placement.x);
             widget.placement = Some(placement);
-            Some(placement)
+            Some(())
         });
-        if let Some(placement) = placement {
+        if updated.is_some() {
             unsafe {
                 SetWindowPos(
                     hwnd,
@@ -2846,6 +2871,61 @@ mod tests {
             horizontal_placement(&layout(vertical, Vec::new()), original, 600),
             None
         );
+    }
+
+    #[test]
+    fn horizontal_drag_avoids_live_clock_and_network_overlays_before_watchdog_refresh() {
+        // Observed taskbar widgets are top-level HWNDs, not Explorer children.
+        // Both the primary monitor and a negative-coordinate secondary must
+        // keep the same taskbar-local clearance from these overlapping meters.
+        for origin_x in [0, -1707] {
+            let bounds = Rect {
+                left: origin_x,
+                top: 1019,
+                right: origin_x + 1707,
+                bottom: 1067,
+            };
+            let mut layout = layout(bounds, Vec::new());
+            layout.landmarks.tray = Some(Rect {
+                left: origin_x + 1409,
+                ..bounds
+            });
+            let original = ChildPlacement {
+                x: 1000,
+                y: 0,
+                width: 104,
+                height: 48,
+            };
+            let live_obstacles = [
+                Rect {
+                    left: origin_x + 1319,
+                    top: 1023,
+                    right: origin_x + 1383,
+                    bottom: 1061,
+                },
+                Rect {
+                    left: origin_x + 1317,
+                    top: 1023,
+                    right: origin_x + 1409,
+                    bottom: 1063,
+                },
+            ];
+            for requested in [1250, 1317, 1390] {
+                assert_eq!(
+                    horizontal_placement_with_obstacles(
+                        &layout,
+                        original,
+                        requested,
+                        &live_obstacles,
+                    ),
+                    Some(ChildPlacement { x: 1205, ..original })
+                );
+            }
+            assert_eq!(
+                horizontal_placement_with_obstacles(&layout, original, 1100, &live_obstacles),
+                Some(ChildPlacement { x: 1100, ..original })
+            );
+        }
     }
 
     #[test]
